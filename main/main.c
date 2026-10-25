@@ -372,16 +372,19 @@ void lvgl_disp_init(void)
 // 按钮颜色切换函数-临时
 static void btn_event_cb(lv_event_t *e)
 {
-    lv_obj_t *btn = lv_event_get_target(e);
-
     static bool switched = false;
     switched = !switched;
 
+    // 获取当前活动屏幕
+    lv_obj_t *scr = lv_scr_act();
+
+    // 切换屏幕背景色：绿色 <-> 红色
     lv_obj_set_style_bg_color(
-        btn,
-        lv_color_hex(switched ? 0xFF8800 : 0x1677FF),
+        scr,
+        lv_color_hex(switched ? 0xFF0000 : 0x00FF00),
         LV_PART_MAIN
     );
+
 
     printf("Button clicked!\n");
 
