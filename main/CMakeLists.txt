@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.c"
+idf_component_register(SRCS "weiruan.c" "jianhao.c" "main.c"
                     INCLUDE_DIRS ".")
 target_compile_definitions(${COMPONENT_LIB} PUBLIC
     LV_COLOR_DEPTH=16

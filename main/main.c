@@ -1,4 +1,5 @@
 ﻿#include <stdio.h>
+#include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -28,6 +29,13 @@
 #define YELLOW_COLOR  0xFFE0
 #define FT6336U_ADDR 0x38
 #define I2C_TP_PORT I2C_NUM_0
+
+
+#define LCD_MADCTL_PORTRAIT   0x48  // 竖屏
+
+// #define LCD_MADCTL_LANDSCAPE  0x28  // 横屏
+#define LCD_MADCTL_LANDSCAPE  0xE8  // 横屏 + 旋转 180°
+
 volatile bool tp_touched_flag = false;
 volatile uint16_t tp_x = 0;
 volatile uint16_t tp_y = 0;
@@ -39,9 +47,25 @@ uint32_t last_touch_ms = 0;
 #define TP_DEBOUNCE_MS 150
 spi_device_handle_t st7796_spi;
 // LVGL显示缓冲区
-static lv_color_t disp_buf[320 * 40];
+static lv_color_t disp_buf[ST7796_HEIGHT * 40];
 static lv_disp_draw_buf_t draw_buf;
 static lv_disp_drv_t disp_drv;
+
+// LVGL 单次 SPI 传输最大字节数
+#define LVGL_SPI_MAX_CHUNK_BYTES 4096
+// 静态缓冲区：用于转换 RGB565 的字节顺序
+static uint8_t lvgl_spi_buf[LVGL_SPI_MAX_CHUNK_BYTES];
+
+// 导入字体
+LV_FONT_DECLARE(weiruan);
+
+static lv_indev_drv_t indev_drv;
+static lv_indev_t *touch_indev;
+
+static uint32_t last_click_ms = 0;
+#define CLICK_DEBOUNCE_MS 200
+
+
 static esp_err_t ft6336_write_reg(uint8_t reg, uint8_t val)
 {
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
@@ -54,6 +78,7 @@ static esp_err_t ft6336_write_reg(uint8_t reg, uint8_t val)
     i2c_cmd_link_delete(cmd);
     return ret;
 }
+
 static esp_err_t ft6336_read_reg(uint8_t reg, uint8_t *buf, uint8_t len)
 {
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
@@ -72,10 +97,12 @@ static esp_err_t ft6336_read_reg(uint8_t reg, uint8_t *buf, uint8_t len)
     i2c_cmd_link_delete(cmd);
     return ret;
 }
+
 static void IRAM_ATTR tp_isr_handler(void* arg)
 {
     tp_touched_flag = true;
 }
+
 void ft6336_init(void)
 {
     // TP_RST
@@ -125,6 +152,7 @@ bool ft6336_get_touch(uint16_t *x, uint16_t *y, uint8_t *point_cnt)
     *y = (yh << 8) | buf[4];
     return true;
 }
+
 void bl_init(void)
 {
     gpio_config_t io_conf = {0};
@@ -135,6 +163,7 @@ void bl_init(void)
     gpio_config(&io_conf);
     gpio_set_level(BL_PIN, 1);
 }
+
 static void st7796_write_cmd(uint8_t cmd)
 {
     gpio_set_level(ST7796_CS, 0);
@@ -146,6 +175,7 @@ static void st7796_write_cmd(uint8_t cmd)
     spi_device_transmit(st7796_spi, &t);
     gpio_set_level(ST7796_CS, 1);
 }
+
 static void st7796_write_data(uint8_t data)
 {
     gpio_set_level(ST7796_CS, 0);
@@ -157,6 +187,7 @@ static void st7796_write_data(uint8_t data)
     spi_device_transmit(st7796_spi, &t);
     gpio_set_level(ST7796_CS, 1);
 }
+
 static void st7796_write_burst_data(const uint8_t *data, int len)
 {
     gpio_set_level(ST7796_CS, 0);
@@ -168,6 +199,13 @@ static void st7796_write_burst_data(const uint8_t *data, int len)
     spi_device_transmit(st7796_spi, &t);
     gpio_set_level(ST7796_CS, 1);
 }
+
+static void st7796_set_orientation(uint8_t madctl)
+{
+    st7796_write_cmd(0x36);
+    st7796_write_data(madctl);
+}
+
 void st7796_set_window(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2)
 {
     st7796_write_cmd(0x2A);
@@ -214,8 +252,7 @@ void st7796_init(void)
     st7796_write_data(0xD3);
     st7796_write_cmd(0xF0);
     st7796_write_data(0x08);
-    st7796_write_cmd(0x36);
-    st7796_write_data(0x48);
+    st7796_set_orientation(LCD_MADCTL_LANDSCAPE);
     st7796_write_cmd(0x3A);
     st7796_write_data(0x55);
     st7796_write_cmd(0xB4);
@@ -252,67 +289,214 @@ void spi_init(void)
     };
     spi_bus_add_device(SPI2_HOST, &devcfg, &st7796_spi);
 }
+
 void lv_flush_cb(lv_disp_drv_t * disp, const lv_area_t * area, lv_color_t * color_p)
 {
-    // =========这里调用你自己写好的ST7796函数=========
-    // st7796_set_window(area->x1, area->y1, area->x2, area->y2);
-    // st7796_write_burst_data((uint8_t*)color_p, (area->x2-area->x1+1)*(area->y2-area->y1+1)*2);
+    // 1. 计算本次刷新的矩形区域大小
+    uint32_t width = area->x2 - area->x1 + 1;
+    uint32_t height = area->y2 - area->y1 + 1;
+    uint32_t total_pixels = width * height;
+
+    // 2. 设置 ST7796 的刷新窗口
+    st7796_set_window(area->x1, area->y1,
+                      area->x2, area->y2);
+
+    // 3. 将 LVGL 像素数据分块发送
+    // 假设 LV_COLOR_DEPTH = 16，且 LV_COLOR_16_SWAP = 0
+    const uint8_t *src = (const uint8_t *)color_p;
+
+    uint32_t offset = 0;
+    const uint32_t pixels_per_chunk =
+        LVGL_SPI_MAX_CHUNK_BYTES / 2;
+
+    while (offset < total_pixels) {
+        uint32_t pixels = total_pixels - offset;
+
+        if (pixels > pixels_per_chunk) {
+            pixels = pixels_per_chunk;
+        }
+
+        // 4. 交换每个 RGB565 像素的两个字节
+        memcpy(lvgl_spi_buf,
+                src + offset * 2,
+                pixels * 2);
+
+        // 5. 通过你现有的 SPI 驱动发送像素
+        st7796_write_burst_data(
+            lvgl_spi_buf, pixels * 2);
+
+        offset += pixels;
+    }
+
     lv_disp_flush_ready(disp);
 }
+
+// LVGL 触摸输入回调（FT6336U）
+static void lv_touch_read_cb(lv_indev_drv_t *drv,
+                             lv_indev_data_t *data)
+{
+    static uint16_t last_tx = 0, last_ty = 0;
+    uint16_t tx = 0, ty = 0;
+    uint8_t point_cnt = 0;
+
+    bool touched = ft6336_get_touch(&tx, &ty, &point_cnt) && point_cnt > 0;
+
+    if (touched) {
+        last_tx = ty;
+        last_ty = tx;
+        data->point.x = ty;
+        data->point.y = tx;
+        data->state = LV_INDEV_STATE_PR;
+    } else {
+        // printf("[INDEV] REL X:%d Y:%d\n", last_tx, last_ty);
+        data->point.x = last_tx;
+        data->point.y = last_ty;
+        data->state = LV_INDEV_STATE_REL;
+    }
+}
+
+
+
+
 void lvgl_disp_init(void)
 {
-    lv_disp_draw_buf_init(&draw_buf, disp_buf, NULL, 320*40);
+    lv_disp_draw_buf_init(&draw_buf, disp_buf, NULL, ST7796_HEIGHT*40);
     lv_disp_drv_init(&disp_drv);
-    disp_drv.hor_res = 320;
-    disp_drv.ver_res = 480;
+    disp_drv.hor_res = ST7796_HEIGHT;
+    disp_drv.ver_res = ST7796_WIDTH;
     disp_drv.flush_cb = lv_flush_cb;
     disp_drv.draw_buf = &draw_buf;
     lv_disp_drv_register(&disp_drv);
 }
+
+// 按钮颜色切换函数-临时
+static void btn_event_cb(lv_event_t *e)
+{
+    lv_obj_t *btn = lv_event_get_target(e);
+
+    static bool switched = false;
+    switched = !switched;
+
+    lv_obj_set_style_bg_color(
+        btn,
+        lv_color_hex(switched ? 0xFF8800 : 0x1677FF),
+        LV_PART_MAIN
+    );
+
+    printf("Button clicked!\n");
+
+}
+
+
 void app_main(void)
 {
+    // 1. 初始化硬件
     bl_init();
     spi_init();
     st7796_init();
     ft6336_init();
-    st7796_fill_color(color_list[color_idx]);
 
-    // lv_init();
-    // printf("LVGL init OK, version: %d.%d.%d\n", LVGL_VERSION_MAJOR,LVGL_VERSION_MINOR,LVGL_VERSION_PATCH);
-    // // 创建一个基础屏幕对象，单纯测试库
-    // lv_obj_t * scr = lv_scr_act();
-    // lv_obj_set_style_bg_color(scr, lv_color_hex(0xFF0000), 0);
-    // // 简单label文字
-    // lv_obj_t * label = lv_label_create(scr);
-    // lv_label_set_text(label, "LVGL TEST OK");
-    // lv_obj_center(label);
-    while(1)
-    {
+    // 2. 初始化 LVGL
+    lv_init();
+
+    printf("LVGL version: %d.%d.%d\n",
+           LVGL_VERSION_MAJOR,
+           LVGL_VERSION_MINOR,
+           LVGL_VERSION_PATCH);
+
+    // 3. 注册显示驱动
+    lvgl_disp_init();
+    // 注册 LVGL 触摸输入设备
+    lv_indev_drv_init(&indev_drv);
+    indev_drv.type = LV_INDEV_TYPE_POINTER;
+    indev_drv.read_cb = lv_touch_read_cb;
+
+    touch_indev = lv_indev_drv_register(&indev_drv);
+
+    // 4. 获取当前活动屏幕
+    lv_obj_t *scr = lv_scr_act();
+
+    // 5. 设置绿色背景
+    lv_obj_set_style_bg_color(
+        scr,
+        lv_color_hex(0x00FF00),
+        LV_PART_MAIN
+    );
+
+    // 创建按钮
+    lv_obj_t *btn = lv_btn_create(scr);
+
+    // 设置按钮尺寸
+    lv_obj_set_size(btn, 160, 70);
+
+    // 居中显示
+    lv_obj_center(btn);
+
+    lv_obj_add_event_cb(
+        btn,
+        btn_event_cb,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+
+
+    // 设置蓝色背景
+    lv_obj_set_style_bg_color(
+        btn,
+        lv_color_hex(0x1677FF),
+        LV_PART_MAIN
+    );
+
+    // 设置按钮不透明
+    lv_obj_set_style_bg_opa(
+        btn,
+        LV_OPA_COVER,
+        LV_PART_MAIN
+    );
+
+    // 设置圆角
+    lv_obj_set_style_radius(
+        btn,
+        12,
+        LV_PART_MAIN
+    );
+
+    // 创建按钮文字
+    lv_obj_t *label = lv_label_create(btn);
+    lv_label_set_text(label, "切换");
+
+    // 设置字体
+    lv_obj_set_style_text_font(
+        label,
+        &weiruan,
+        LV_PART_MAIN
+    );
+
+
+    // 设置文字颜色为白色
+    lv_obj_set_style_text_color(
+        label,
+        lv_color_hex(0xFFFFFF),
+        LV_PART_MAIN
+    );
+
+    // 文字在按钮中央
+    lv_obj_center(label);
+
+    // 确保背景完全不透明
+    lv_obj_set_style_bg_opa(
+        scr,
+        LV_OPA_COVER,
+        LV_PART_MAIN
+    );
+
+    // 6. 处理 LVGL 的定时器和刷新任务
+    while (1) {
         lv_timer_handler();
         vTaskDelay(pdMS_TO_TICKS(10));
-        if(tp_touched_flag)
-        {
-            
-            // ✅ 【关键1：不管读没读到触摸，进来就立刻清flag】
-            tp_touched_flag = false;
-            uint16_t tx, ty;
-            uint8_t point_cnt;
-            if(ft6336_get_touch(&tx, &ty, &point_cnt))
-            {
-                // ✅ 【关键2：只有真实按下（point_cnt>0）+消抖时间到，才切换】
-                uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-                if(now - last_touch_ms > TP_DEBOUNCE_MS)
-                {
-                    last_touch_ms = now;
-                    printf("Touch DOWN X:%d Y:%d\n", tx, ty);
-                    color_idx ++;
-                    if(color_idx >= COLOR_CNT) color_idx = 0;
-                    st7796_fill_color(color_list[color_idx]);
-                }
-            }
-            // 读到point_cnt=0（松开事件）直接跳过，不打印、不切换
-            vTaskDelay(pdMS_TO_TICKS(20));
-        }
-        vTaskDelay(pdMS_TO_TICKS(20));
+        lv_tick_inc(10);
+        // lv_area_t btn_area;
+        // lv_obj_get_coords(btn, &btn_area);
+        // printf("BTN: x1=%d y1=%d x2=%d y2=%d\n", btn_area.x1, btn_area.y1, btn_area.x2, btn_area.y2);
     }
 }
