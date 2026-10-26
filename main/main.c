@@ -19,32 +19,33 @@
 #define TP_SCL      GPIO_NUM_22
 #define TP_INT      GPIO_NUM_25
 #define TP_RST      GPIO_NUM_32
-#define ST7796_WIDTH    320
-#define ST7796_HEIGHT   480
-#define RED_COLOR       0xF800
-#define GREEN_COLOR   0x07E0
-#define BLUE_COLOR    0x001F
-#define WHITE_COLOR   0xFFFF
-#define BLACK_COLOR   0x0000
-#define YELLOW_COLOR  0xFFE0
+#define RED_COLOR       0xFF0000
+#define GREEN_COLOR     0x00FF00
+#define BLUE_COLOR      0x1677FF
+#define WHITE_COLOR     0xFFFFFF
+#define BLACK_COLOR     0x000000
+#define YELLOW_COLOR    0xFFE000
+
 #define FT6336U_ADDR 0x38
 #define I2C_TP_PORT I2C_NUM_0
 
-
-#define LCD_MADCTL_PORTRAIT   0x48  // 竖屏
+// #define LCD_MADCTL_PORTRAIT   0x48  // 竖屏
+// #define ST7796_WIDTH    320
+// #define ST7796_HEIGHT   480
 
 // #define LCD_MADCTL_LANDSCAPE  0x28  // 横屏
+#define ST7796_WIDTH    320
+#define ST7796_HEIGHT   480
 #define LCD_MADCTL_LANDSCAPE  0xE8  // 横屏 + 旋转 180°
 
 volatile bool tp_touched_flag = false;
-volatile uint16_t tp_x = 0;
-volatile uint16_t tp_y = 0;
+
+// 颜色切换列表
 uint8_t color_idx = 0;
-const uint16_t color_list[] = {RED_COLOR, GREEN_COLOR, BLUE_COLOR, WHITE_COLOR, BLACK_COLOR, YELLOW_COLOR};
+const uint32_t color_list[] = {GREEN_COLOR, RED_COLOR, BLUE_COLOR, WHITE_COLOR, BLACK_COLOR, YELLOW_COLOR};
 #define COLOR_CNT (sizeof(color_list)/sizeof(color_list[0]))
+
 // 新增消抖时间戳
-uint32_t last_touch_ms = 0;
-#define TP_DEBOUNCE_MS 150
 spi_device_handle_t st7796_spi;
 // LVGL显示缓冲区
 static lv_color_t disp_buf[ST7796_HEIGHT * 40];
@@ -61,10 +62,6 @@ LV_FONT_DECLARE(weiruan);
 
 static lv_indev_drv_t indev_drv;
 static lv_indev_t *touch_indev;
-
-static uint32_t last_click_ms = 0;
-#define CLICK_DEBOUNCE_MS 200
-
 
 static esp_err_t ft6336_write_reg(uint8_t reg, uint8_t val)
 {
@@ -98,11 +95,6 @@ static esp_err_t ft6336_read_reg(uint8_t reg, uint8_t *buf, uint8_t len)
     return ret;
 }
 
-static void IRAM_ATTR tp_isr_handler(void* arg)
-{
-    tp_touched_flag = true;
-}
-
 void ft6336_init(void)
 {
     // TP_RST
@@ -132,7 +124,7 @@ void ft6336_init(void)
     int_conf.intr_type = GPIO_INTR_NEGEDGE;
     gpio_config(&int_conf);
     gpio_install_isr_service(0);
-    gpio_isr_handler_add(TP_INT, tp_isr_handler, NULL);
+    // gpio_isr_handler_add(TP_INT, tp_isr_handler, NULL);
 }
 // FT6336U 读取单点坐标，重点！寄存器0x03开始
 bool ft6336_get_touch(uint16_t *x, uint16_t *y, uint8_t *point_cnt)
@@ -355,9 +347,6 @@ static void lv_touch_read_cb(lv_indev_drv_t *drv,
     }
 }
 
-
-
-
 void lvgl_disp_init(void)
 {
     lv_disp_draw_buf_init(&draw_buf, disp_buf, NULL, ST7796_HEIGHT*40);
@@ -370,24 +359,35 @@ void lvgl_disp_init(void)
 }
 
 // 按钮颜色切换函数-临时
-static void btn_event_cb(lv_event_t *e)
+// 延迟执行背景颜色切换
+static void background_change_timer_cb(lv_timer_t *timer)
 {
-    static bool switched = false;
-    switched = !switched;
-
-    // 获取当前活动屏幕
     lv_obj_t *scr = lv_scr_act();
 
-    // 切换屏幕背景色：绿色 <-> 红色
     lv_obj_set_style_bg_color(
         scr,
-        lv_color_hex(switched ? 0xFF0000 : 0x00FF00),
+        lv_color_hex(color_list[color_idx]),
         LV_PART_MAIN
     );
 
+    // 只执行一次
+    lv_timer_del(timer);
+}
+
+// 按钮点击回调
+static void btn_event_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+        return;
+    }
+
+    // 循环切换颜色索引
+    color_idx = (color_idx + 1) % COLOR_CNT;
+
+    // 延迟 150 ms 再修改背景
+    lv_timer_create(background_change_timer_cb, 100, NULL);
 
     printf("Button clicked!\n");
-
 }
 
 
