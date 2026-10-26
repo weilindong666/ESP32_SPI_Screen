@@ -34,8 +34,8 @@
 // #define ST7796_HEIGHT   480
 
 // #define LCD_MADCTL_LANDSCAPE  0x28  // 横屏
-#define ST7796_WIDTH    320
-#define ST7796_HEIGHT   480
+#define ST7796_HEIGHT    320
+#define ST7796_WIDTH   480
 #define LCD_MADCTL_LANDSCAPE  0xE8  // 横屏 + 旋转 180°
 
 volatile bool tp_touched_flag = false;
@@ -48,7 +48,7 @@ const uint32_t color_list[] = {GREEN_COLOR, RED_COLOR, BLUE_COLOR, WHITE_COLOR, 
 // 新增消抖时间戳
 spi_device_handle_t st7796_spi;
 // LVGL显示缓冲区
-static lv_color_t disp_buf[ST7796_HEIGHT * 40];
+static lv_color_t disp_buf[ST7796_WIDTH * 40];
 static lv_disp_draw_buf_t draw_buf;
 static lv_disp_drv_t disp_drv;
 
@@ -214,7 +214,7 @@ void st7796_set_window(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2)
 }
 void st7796_fill_color(uint16_t color)
 {
-    st7796_set_window(0, 0, ST7796_WIDTH - 1, ST7796_HEIGHT - 1);
+    st7796_set_window(0, 0, ST7796_HEIGHT - 1, ST7796_WIDTH - 1);
     uint8_t buf[256];
     uint8_t c_h = color >> 8;
     uint8_t c_l = color & 0xFF;
@@ -223,7 +223,7 @@ void st7796_fill_color(uint16_t color)
         buf[i] = c_h;
         buf[i+1] = c_l;
     }
-    int total_pixel = ST7796_WIDTH * ST7796_HEIGHT;
+    int total_pixel = ST7796_HEIGHT * ST7796_WIDTH;
     int burst = sizeof(buf)/2;
     while(total_pixel > 0)
     {
@@ -334,25 +334,26 @@ static void lv_touch_read_cb(lv_indev_drv_t *drv,
     bool touched = ft6336_get_touch(&tx, &ty, &point_cnt) && point_cnt > 0;
 
     if (touched) {
-        last_tx = ty;
-        last_ty = tx;
-        data->point.x = ty;
+        last_tx = tx;
+        last_ty = ty;
+        printf("[INDEV] REL X:%d Y:%d\n", tx, ty);
+        data->point.x = ST7796_WIDTH-ty;
         data->point.y = tx;
         data->state = LV_INDEV_STATE_PR;
     } else {
         // printf("[INDEV] REL X:%d Y:%d\n", last_tx, last_ty);
-        data->point.x = last_tx;
-        data->point.y = last_ty;
+        data->point.x = ST7796_WIDTH-last_ty;
+        data->point.y = last_tx;
         data->state = LV_INDEV_STATE_REL;
     }
 }
 
 void lvgl_disp_init(void)
 {
-    lv_disp_draw_buf_init(&draw_buf, disp_buf, NULL, ST7796_HEIGHT*40);
+    lv_disp_draw_buf_init(&draw_buf, disp_buf, NULL, ST7796_WIDTH*40);
     lv_disp_drv_init(&disp_drv);
-    disp_drv.hor_res = ST7796_HEIGHT;
-    disp_drv.ver_res = ST7796_WIDTH;
+    disp_drv.hor_res = ST7796_WIDTH;
+    disp_drv.ver_res = ST7796_HEIGHT;
     disp_drv.flush_cb = lv_flush_cb;
     disp_drv.draw_buf = &draw_buf;
     lv_disp_drv_register(&disp_drv);
@@ -433,7 +434,8 @@ void app_main(void)
     lv_obj_set_size(btn, 160, 70);
 
     // 居中显示
-    lv_obj_center(btn);
+    // lv_obj_center(btn);
+    lv_obj_set_pos(btn, 300, 230);
 
     lv_obj_add_event_cb(
         btn,
