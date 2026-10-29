@@ -7,7 +7,7 @@
 #include <string.h>
 #include "driver/i2c.h"
 #include "lvgl.h"
-
+#include "demos/lv_demos.h"
 
 #define ST7796_SCLK   GPIO_NUM_18
 #define ST7796_MOSI     GPIO_NUM_23
@@ -19,12 +19,15 @@
 #define TP_SCL      GPIO_NUM_22
 #define TP_INT      GPIO_NUM_25
 #define TP_RST      GPIO_NUM_32
-#define RED_COLOR       0xFF0000
-#define GREEN_COLOR     0x00FF00
-#define BLUE_COLOR      0x1677FF
-#define WHITE_COLOR     0xFFFFFF
-#define BLACK_COLOR     0x000000
-#define YELLOW_COLOR    0xFFE000
+// 所有应用层颜色统一使用 RGB565（R5-G6-B5）格式。
+// 这些值可以直接传给 st7796_fill_color()；用于 LVGL 时通过
+// lv_color_from_rgb565() 转换，以适配 LV_COLOR_16_SWAP。
+#define RED_COLOR       0xF800
+#define GREEN_COLOR     0x07E0
+#define BLUE_COLOR      0x13BF  // 由原来的 RGB888 0x1677FF 量化得到
+#define WHITE_COLOR     0xFFFF
+#define BLACK_COLOR     0x0000
+#define YELLOW_COLOR    0xFF00  // 由原来的 RGB888 0xFFE000 量化得到
 
 #define FT6336U_ADDR 0x38
 #define I2C_TP_PORT I2C_NUM_0
@@ -37,25 +40,34 @@
 #define ST7796_HEIGHT    320
 #define ST7796_WIDTH   480
 #define LCD_MADCTL_LANDSCAPE  0xE8  // 横屏 + 旋转 180°
+#define ST7796_SPI_CLOCK_HZ (32 * 1000 * 1000)
 
 volatile bool tp_touched_flag = false;
 
 // 颜色切换列表
 uint8_t color_idx = 0;
-const uint32_t color_list[] = {GREEN_COLOR, RED_COLOR, BLUE_COLOR, WHITE_COLOR, BLACK_COLOR, YELLOW_COLOR};
+const uint16_t color_list[] = {GREEN_COLOR, RED_COLOR, BLUE_COLOR, WHITE_COLOR, BLACK_COLOR, YELLOW_COLOR};
 #define COLOR_CNT (sizeof(color_list)/sizeof(color_list[0]))
 
 // 新增消抖时间戳
 spi_device_handle_t st7796_spi;
 // LVGL显示缓冲区
-static lv_color_t disp_buf[ST7796_WIDTH * 40];
+static lv_color_t disp_buf[ST7796_WIDTH * 100];
 static lv_disp_draw_buf_t draw_buf;
 static lv_disp_drv_t disp_drv;
 
-// LVGL 单次 SPI 传输最大字节数
-#define LVGL_SPI_MAX_CHUNK_BYTES 4096
-// 静态缓冲区：用于转换 RGB565 的字节顺序
-static uint8_t lvgl_spi_buf[LVGL_SPI_MAX_CHUNK_BYTES];
+static inline lv_color_t lv_color_from_rgb565(uint16_t rgb565)
+{
+    uint8_t r = (uint8_t)(((rgb565 >> 11) & 0x1F) << 3);
+    uint8_t g = (uint8_t)(((rgb565 >> 5) & 0x3F) << 2);
+    uint8_t b = (uint8_t)((rgb565 & 0x1F) << 3);
+    return lv_color_make(r, g, b);
+}
+
+// ESP32 SPI DMA 单次传输的安全上限是 4092 字节（不是 4096）。
+// 超过该值时 spi_device_transmit 会返回 ESP_ERR_INVALID_ARG，原代码未检查该错误，
+// 会导致像素数据没有发到屏幕，屏幕保持白色。
+#define LVGL_SPI_MAX_CHUNK_BYTES 4092
 
 // 导入字体
 LV_FONT_DECLARE(weiruan);
@@ -164,7 +176,10 @@ static void st7796_write_cmd(uint8_t cmd)
         .length = 8,
         .tx_buffer = &cmd,
     };
-    spi_device_transmit(st7796_spi, &t);
+    esp_err_t ret = spi_device_transmit(st7796_spi, &t);
+    if (ret != ESP_OK) {
+        printf("[LCD] command 0x%02X failed: %s\n", cmd, esp_err_to_name(ret));
+    }
     gpio_set_level(ST7796_CS, 1);
 }
 
@@ -176,7 +191,10 @@ static void st7796_write_data(uint8_t data)
         .length = 8,
         .tx_buffer = &data,
     };
-    spi_device_transmit(st7796_spi, &t);
+    esp_err_t ret = spi_device_transmit(st7796_spi, &t);
+    if (ret != ESP_OK) {
+        printf("[LCD] data 0x%02X failed: %s\n", data, esp_err_to_name(ret));
+    }
     gpio_set_level(ST7796_CS, 1);
 }
 
@@ -188,7 +206,10 @@ static void st7796_write_burst_data(const uint8_t *data, int len)
         .length = len * 8,
         .tx_buffer = data,
     };
-    spi_device_transmit(st7796_spi, &t);
+    esp_err_t ret = spi_device_transmit(st7796_spi, &t);
+    if (ret != ESP_OK) {
+        printf("[LCD] pixel transfer (%d bytes) failed: %s\n", len, esp_err_to_name(ret));
+    }
     gpio_set_level(ST7796_CS, 1);
 }
 
@@ -214,7 +235,7 @@ void st7796_set_window(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2)
 }
 void st7796_fill_color(uint16_t color)
 {
-    st7796_set_window(0, 0, ST7796_HEIGHT - 1, ST7796_WIDTH - 1);
+    st7796_set_window(0, 0, ST7796_WIDTH - 1, ST7796_HEIGHT - 1);
     uint8_t buf[256];
     uint8_t c_h = color >> 8;
     uint8_t c_l = color & 0xFF;
@@ -270,16 +291,26 @@ void spi_init(void)
         .sclk_io_num = ST7796_SCLK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = 4096,
+        .max_transfer_sz = LVGL_SPI_MAX_CHUNK_BYTES,
     };
-    spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    esp_err_t ret = spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK) {
+        printf("[LCD] SPI bus init failed: %s\n", esp_err_to_name(ret));
+        return;
+    }
     spi_device_interface_config_t devcfg = {
-        .clock_speed_hz = 5 * 1000 * 1000,
+        .clock_speed_hz = ST7796_SPI_CLOCK_HZ,
         .mode = 0,
         .spics_io_num = -1,
         .queue_size = 7,
     };
-    spi_bus_add_device(SPI2_HOST, &devcfg, &st7796_spi);
+    ret = spi_bus_add_device(SPI2_HOST, &devcfg, &st7796_spi);
+    if (ret != ESP_OK) {
+        printf("[LCD] SPI device init failed: %s\n", esp_err_to_name(ret));
+        return;
+    }
+    printf("[LCD] SPI ready: %lu Hz, max transfer %d bytes\n",
+           (unsigned long)ST7796_SPI_CLOCK_HZ, LVGL_SPI_MAX_CHUNK_BYTES);
 }
 
 void lv_flush_cb(lv_disp_drv_t * disp, const lv_area_t * area, lv_color_t * color_p)
@@ -289,12 +320,20 @@ void lv_flush_cb(lv_disp_drv_t * disp, const lv_area_t * area, lv_color_t * colo
     uint32_t height = area->y2 - area->y1 + 1;
     uint32_t total_pixels = width * height;
 
+    static bool first_flush = true;
+    if (first_flush) {
+        printf("[LVGL] first flush: area=(%d,%d)-(%d,%d), pixels=%lu\n",
+               area->x1, area->y1, area->x2, area->y2,
+               (unsigned long)total_pixels);
+        first_flush = false;
+    }
+
     // 2. 设置 ST7796 的刷新窗口
     st7796_set_window(area->x1, area->y1,
                       area->x2, area->y2);
 
-    // 3. 将 LVGL 像素数据分块发送
-    // 假设 LV_COLOR_DEPTH = 16，且 LV_COLOR_16_SWAP = 0
+    // 3. 将 LVGL 像素数据分块发送。
+    // LV_COLOR_16_SWAP 已在 sdkconfig 中开启，LVGL 缓冲区可直接按字节发送。
     const uint8_t *src = (const uint8_t *)color_p;
 
     uint32_t offset = 0;
@@ -308,14 +347,8 @@ void lv_flush_cb(lv_disp_drv_t * disp, const lv_area_t * area, lv_color_t * colo
             pixels = pixels_per_chunk;
         }
 
-        // 4. 交换每个 RGB565 像素的两个字节
-        memcpy(lvgl_spi_buf,
-                src + offset * 2,
-                pixels * 2);
-
-        // 5. 通过你现有的 SPI 驱动发送像素
-        st7796_write_burst_data(
-            lvgl_spi_buf, pixels * 2);
+        // 4. 直接发送 LVGL 缓冲区，避免每个分块再 memcpy 一次。
+        st7796_write_burst_data(src + offset * 2, pixels * 2);
 
         offset += pixels;
     }
@@ -350,7 +383,8 @@ static void lv_touch_read_cb(lv_indev_drv_t *drv,
 
 void lvgl_disp_init(void)
 {
-    lv_disp_draw_buf_init(&draw_buf, disp_buf, NULL, ST7796_WIDTH*40);
+    // 使用已有的 480 x 100 缓冲区，减少整屏刷新时的 flush 回调次数。
+    lv_disp_draw_buf_init(&draw_buf, disp_buf, NULL, ST7796_WIDTH * 100);
     lv_disp_drv_init(&disp_drv);
     disp_drv.hor_res = ST7796_WIDTH;
     disp_drv.ver_res = ST7796_HEIGHT;
@@ -367,7 +401,7 @@ static void background_change_timer_cb(lv_timer_t *timer)
 
     lv_obj_set_style_bg_color(
         scr,
-        lv_color_hex(color_list[color_idx]),
+        lv_color_from_rgb565(color_list[color_idx]),
         LV_PART_MAIN
     );
 
@@ -417,13 +451,15 @@ void app_main(void)
 
     touch_indev = lv_indev_drv_register(&indev_drv);
 
+    // lv_demo_widgets();
+
     // 4. 获取当前活动屏幕
     lv_obj_t *scr = lv_scr_act();
 
     // 5. 设置绿色背景
     lv_obj_set_style_bg_color(
         scr,
-        lv_color_hex(0x00FF00),
+        lv_color_from_rgb565(GREEN_COLOR),
         LV_PART_MAIN
     );
 
@@ -434,8 +470,8 @@ void app_main(void)
     lv_obj_set_size(btn, 160, 70);
 
     // 居中显示
-    // lv_obj_center(btn);
-    lv_obj_set_pos(btn, 300, 230);
+    lv_obj_center(btn);
+    // lv_obj_set_pos(btn, 300, 230);
 
     lv_obj_add_event_cb(
         btn,
@@ -448,7 +484,7 @@ void app_main(void)
     // 设置蓝色背景
     lv_obj_set_style_bg_color(
         btn,
-        lv_color_hex(0x1677FF),
+        lv_color_from_rgb565(BLUE_COLOR),
         LV_PART_MAIN
     );
 
@@ -481,7 +517,7 @@ void app_main(void)
     // 设置文字颜色为白色
     lv_obj_set_style_text_color(
         label,
-        lv_color_hex(0xFFFFFF),
+        lv_color_from_rgb565(WHITE_COLOR),
         LV_PART_MAIN
     );
 
